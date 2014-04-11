@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>LEAP AR Oimo</title>
+	<meta charset="UTF-8"/>
+	
+	<link href='http://fonts.googleapis.com/css?family=Fauna+One' rel='stylesheet' type='text/css'>
+	<link rel="stylesheet" href="css/style.css">
+	
+	<!--load helper libraries-->
+	<script type="text/javascript" src="js/lib/jquery-2.0.2.min.js"></script>
+	
+	<!--load webcam streaming libraries-->
+	<script type="text/javascript" src="js/lib/webrtc_adapter.js"></script>
+	<script type="text/javascript" src="js/streamvideo.js"></script>
+	
+	<!--load AR and 3D libraries-->
+	<script type="text/javascript" src="js/lib/JSARToolKit.js"></script>
+	
+	<script src="js/three.js"></script>
+	<script src="build/Oimo.js"></script>
+	<script src="js/leap.js"></script>
+	
+	<script>
+	
+	//declare some global variables
+	var DEBUG = true;  //turn on JSARToolKit built-in debugging info
+	var threshold = 128;
+	
+	// I'm going to use a glMatrix-style matrix as an intermediary.
+	// So the first step is to create a function to convert a glMatrix matrix into a Three.js Matrix4.
+	THREE.Matrix4.prototype.setFromArray = function(m) {
+	  return this.set(
+		m[0], m[4], m[8], m[12],
+		m[1], m[5], m[9], m[13],
+		m[2], m[6], m[10], m[14],
+		m[3], m[7], m[11], m[15]
+	  );
+	};
+	
+	function copyMarkerMatrix4(arMat, glMat)
+	{
+	  glMat[0] = arMat.m00;
+	  glMat[1] = -arMat.m10;
+	  glMat[2] = arMat.m20;
+	  glMat[3] = 0;
+	  glMat[4] = arMat.m01;
+	  glMat[5] = -arMat.m11;
+	  glMat[6] = arMat.m21;
+	  glMat[7] = 0;
+	  glMat[8] = -arMat.m02;
+	  glMat[9] = arMat.m12;
+	  glMat[10] = -arMat.m22;
+	  glMat[11] = 0;
+	  glMat[12] = arMat.m03;
+	  glMat[13] = -arMat.m13;
+	  glMat[14] = arMat.m23;
+	  glMat[15] = 1;
+	}
+	
+
+	
+	$(document).ready(function()
+	{
+		console.log('Document is ready.');
+		
+		//=================================================== THREE.JS ===================================================
+	    // three var
+		var markerRoot;
+	    var meshs = [];
+	    var geoBox, geoSphere;
+	    var matBox, matSphere, matBoxSleep, matSphereSleep;
+	
+		
+		var renderer	= new THREE.WebGLRenderer({ 
+			precision: "mediump",
+			antialias	: false
+		});
+		renderer.setSize(640, 480);
+		renderer.setClearColor( 0x585858, 1 ); 
+		
+		var $container = $('#threejs-container');
+		$container.append(renderer.domElement);
+
+		// create the scene
+		var scene	= new THREE.Scene();
+
+		// Create a camera and a marker root object for your Three.js scene.
+		var camera = new THREE.Camera(); 
+		//camera.position.z = 500;
+	  	//camera.position.y = 200;
+	  	//camera.lookAt(new THREE.Vector3(0,200,0)); 
+		//camera.position.z = 5;
+		scene.add(camera); 
+
+   	
+		//=================================================== AR ===================================================
+		var $canvas = $('#mainCanvas')[0];
+		
+		var raster = new NyARRgbRaster_Canvas2D($canvas);
+
+		// FLARParam is the thing used by FLARToolKit to set camera parameters.
+		// Here we create a FLARParam for images with 320x240 pixel dimensions.
+		var param = new FLARParam(640, 480);
+
+		// The FLARMultiIdMarkerDetector is the actual detection engine for marker detection.
+		// It detects multiple ID markers. ID markers are special markers that encode a number.
+		var detector = new FLARMultiIdMarkerDetector(param, 120);
+
+		// For tracking video set continue mode to true. In continue mode, the detector
+		// tracks markers across multiple frames.
+		detector.setContinueMode(true);
+		
+		
+		
+		//stream to video element
+		var $video = $('#mainVideo')[0];
+		streamVideo($video);
+		var source = $video;	
+		   
+		var markerRoots = {};
+		// glMatrix matrices are flat arrays.
+		var tmp = new Float32Array(16);
+		var rotMtx3, elr;
+		
+		// Next we need to make the Three.js camera use the FLARParam matrix.
+		param.copyCameraMatrix(tmp, 10, 10000);
+		camera.projectionMatrix.setFromArray(tmp);
+
+		// Create scene and quad for the video.
+		//NOTE: must use <canvas> as the texture, not <video>, otherwise there will be a 1-frame lag
+		var videoTex 	= new THREE.Texture($canvas);
+		var geometry	= new THREE.PlaneGeometry(2, 2, 0);
+		var material	= new THREE.MeshBasicMaterial({
+			map		: videoTex,
+			depthTest	: false,
+			depthWrite	: false
+		});
+		var plane	= new THREE.Mesh(geometry, material );
+		var videoScene	= new THREE.Scene();
+		var videoCam	= new THREE.Camera();
+		videoScene.add(plane);
+		videoScene.add(videoCam);
+		
+		// Create a NyARTransMatResult object for getting the marker translation matrices.
+		var resultMat = new NyARTransMatResult();
+
+		var markers = {};   
+		var emptyFloatArray = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+
+		
+	
+		
+		    
+		//=================================================== OIMO.JS ===================================================  
+	    //oimo var                
+	    var world;
+	    var bodys = [];
+		var ground, ground2
+	    var fps=0, time, time_prev=0, fpsint = 0;
+	    var type=1;
+
+		world = new OIMO.World();   
+		
+		//add ground mesh
+        var mat = new THREE.MeshLambertMaterial( { color: 0x151515, wireframe:false, side:THREE.DoubleSide } );
+        matSphere = new THREE.MeshLambertMaterial( { map: basicTexture(0), name:'sph', side:THREE.DoubleSide } );
+        matBox = new THREE.MeshLambertMaterial( {  map: basicTexture(2), name:'box', side:THREE.DoubleSide } );
+        matSphereSleep = new THREE.MeshLambertMaterial( { map: basicTexture(1), name:'ssph', side:THREE.DoubleSide } );
+        matBoxSleep = new THREE.MeshLambertMaterial( {  map: basicTexture(3), name:'sbox', side:THREE.DoubleSide } );
+
+        var geo0 = new THREE.CubeGeometry( 100, 40, 400 ); //ground1
+        var geo1 = new THREE.CubeGeometry( 400, 40, 400 ); //ground2
+		var box	= new THREE.CubeGeometry(120,120,120);
+		geoSphere = new THREE.SphereGeometry( 1 , 20, 10 );
+        geoBox = new THREE.CubeGeometry( 1, 1, 1 );
+
+        var mground0 = new THREE.Mesh( geo0, mat );
+        mground0.position.y = -20;  
+        var mground1 = new THREE.Mesh( geo1, mat );
+        mground1.position.y = -50; 
+
+
+		var sc = new OIMO.ShapeConfig();
+		sc.density = 10;
+		sc.friction = 0.5;
+		sc.restitution = 0.5; 
+		
+		
+		
+		
+		//=================================================== LEAP ===================================================
+		var fingers = {};
+	  	var dedos = {};
+        var leaploop = function(){ 
+		  Leap.loop(function(frame) {
+
+		    var fingerIds = {};
+		    var handIds = {};
+
+		    for (var index = 0; index < frame.pointables.length; index++) {
+
+		      var pointable = frame.pointables[index];
+		      var finger = fingers[pointable.id];
+			  var dedo = dedos[pointable.id];
+
+		      var pos = pointable.tipPosition;
+		      var dir = pointable.direction;
+
+		      var origin = new THREE.Vector3(pos[0], pos[1], pos[2]);
+		      var direction = new THREE.Vector3(dir[0], dir[1], dir[2]);
+
+		      if (!finger) {
+		        finger = new THREE.ArrowHelper(origin, direction, 40, Math.random() * 0xffffff); 
+				finger.matrixAutoUpdate = true;
+				dedo = new THREE.Mesh(
+				  new THREE.CubeGeometry(10,80,10),
+				  new THREE.MeshNormalMaterial({color: 0xff00ff, wireframe:false})
+				);  
+		        fingers[pointable.id] = finger;
+				dedos[pointable.id] = dedo;
+		        markerRoot.add(finger);
+				markerRoot.add(dedo);
+		      }
+
+		      finger.position = origin;
+		      finger.setDirection(direction);
+
+		      dedo.position.setFromMatrixPosition( finger.matrix );
+		      dedo.rotation.setFromRotationMatrix( finger.matrix );
+
+		      fingerIds[pointable.id] = true;
+		    }
+
+		    for (fingerId in fingers) {
+		      if (!fingerIds[fingerId]) {
+		        markerRoot.remove(fingers[fingerId]);
+				markerRoot.remove(dedos[fingerId]);
+		        delete fingers[fingerId];
+				delete dedos[fingerId];
+		      }
+		    }
+
+		    //if(frame.gestures.length > 0) console.log(frame.gestures);
+
+		    renderer.render(scene, camera);
+		  });
+		}
+		 
+		
+		
+		
+		
+		
+
+		//=================================================== INIT ===================================================
+		loop();
+		setTimeout(leaploop, 1000);		
+		
+		
+		//============================================== FUNCTIONS =================================================== 	 
+	    function gravity(g){
+	        nG = -10;
+	        world.gravity = new OIMO.Vec3(0, nG, 0);
+	    }
+
+	    function basicTexture(n){
+
+	        var canvas = document.createElement( 'canvas' );
+	        canvas.width = canvas.height = 64;
+	        var ctx = canvas.getContext( '2d' );
+	        var colors = [];
+	        if(n===0){ // sphere
+	            colors[0] = "#58AA80";
+	            colors[1] = "#58FFAA";
+	        }
+	        if(n===1){ // sphere sleep
+	            colors[0] = "#383838";
+	            colors[1] = "#38AA80";
+	        }
+	        if(n===2){ // box
+	            colors[0] = "#AA8058";
+	            colors[1] = "#FFAA58";
+	        }
+	        if(n===3){ // box sleep
+	            colors[0] = "#383838";
+	            colors[1] = "#AA8038";
+	        }
+	        ctx.fillStyle = colors[0];
+	        ctx.fillRect(0, 0, 64, 64);
+	        ctx.fillStyle = colors[1];
+	        ctx.fillRect(0, 0, 32, 32);
+	        ctx.fillRect(32, 32, 32, 32);
+
+	        var tx = new THREE.Texture(canvas);
+	        tx.needsUpdate = true;
+	        return tx;
+
+	    }
+		
+		function loopOimo() {
+			if(meshs) {
+				//START LOOP OIMO 
+				world.step();
+
+		        var p, r, m, x, y, z;
+		        var mtx = new THREE.Matrix4();
+		        var i = bodys.length;
+		        var mesh;
+
+		        while (i--){
+
+		            mesh = meshs[i];
+
+		            if(!bodys[i].sleeping){
+		                m = bodys[i].getMatrix();
+		                mtx.fromArray(m);
+		                mesh.position.setFromMatrixPosition( mtx );
+		                mesh.rotation.setFromRotationMatrix( mtx );
+
+		                // change material
+		                if(mesh.material.name === 'sbox') mesh.material = matBox;
+		                if(mesh.material.name === 'ssph') mesh.material = matSphere; 
+
+		                // reset position
+		                if(m[13]<-1300){
+		                    x = -100 + Math.random()*200;
+		                    z = +1400 + Math.random()*200;
+		                    y = 100 + Math.random()*1000;
+		                    bodys[i].setPosition(x,y,z);
+		                }
+		            } else {
+		                if(mesh.material.name === 'box') mesh.material = matBoxSleep;
+		                if(mesh.material.name === 'sph') mesh.material = matSphereSleep;
+		            }
+		        }
+		
+		
+		        if(rotMtx3) {
+					elr = OIMO.MatrixToEuler(rotMtx3);
+					
+					// Ground 1
+					ground.body.setRotation(elr[0] * (180 / Math.PI), elr[1] * (180 / Math.PI), elr[2] * (180 / Math.PI)); 
+					ground.body.setPosition(tmp[12],tmp[13],tmp[14]); 
+
+					// Ground 2
+					ground2.body.setRotation(elr[0] * (180 / Math.PI), elr[1] * (180 / Math.PI), elr[2] * (180 / Math.PI));
+					ground2.body.setPosition(tmp[12],tmp[13],tmp[14]);  
+
+
+
+					var groundMtx = new THREE.Matrix4();
+					groundM = ground.body.getMatrix();
+	                groundMtx.fromArray(groundM);
+	                mground0.position.setFromMatrixPosition( groundMtx );
+	                mground0.rotation.setFromRotationMatrix( groundMtx ); 
+
+					var ground2Mtx = new THREE.Matrix4();
+					ground2M = ground.body.getMatrix();
+	                ground2Mtx.fromArray(ground2M);
+	                mground1.position.setFromMatrixPosition( ground2Mtx );
+	                mground1.rotation.setFromRotationMatrix( ground2Mtx );
+				}				
+				
+
+				
+				 
+		        // END LOOP OIMO    
+			}
+		}
+		
+		
+		// On every frame do the following:
+		function loop()
+		{
+			if ($video.readyState === $video.HAVE_ENOUGH_DATA)
+			{
+				// Draw the video frame to the canvas.
+				$canvas.getContext('2d').drawImage($video, 0, 0, $canvas.width, $canvas.height);
+
+				// Tell JSARToolKit that the canvas has changed.
+				$canvas.changed = true;
+
+				// Update the video texture.
+				videoTex.needsUpdate = true;
+
+				//move all marker roots to origin so that they will disappear when not tracked
+				Object.keys(markerRoots).forEach(function (key){
+					markerRoots[key].matrix.setFromArray(emptyFloatArray);
+					markerRoots[key].matrixWorldNeedsUpdate = true;
+				});
+				
+				// Do marker detection by using the detector object on the raster object.
+				// The threshold parameter determines the threshold value
+				// for turning the video frame into a 1-bit black-and-white image.
+				//
+				//NOTE: THE CANVAS MUST BE THE SAME SIZE AS THE RASTER
+				//OTHERWISE WILL GET AN "Uncaught #<Object>" ERROR
+				var markerCount = detector.detectMarkerLite(raster, threshold);
+				
+				// Go through the detected markers and get their IDs and transformation matrices.
+				for (var iAR=0; iAR<markerCount; iAR++)
+				{
+				
+					// Get the ID marker data for the current marker.
+					// ID markers are special kind of markers that encode a number.
+					// The bytes for the number are in the ID marker data.
+					var id = detector.getIdMarkerData(iAR);
+
+
+					// Read bytes from the id packet.
+					var currId = -1;
+					// This code handles only 32-bit numbers or shorter.
+					if (id.packetLength <= 4) {
+						currId = 0;
+						for (var j = 0; j < id.packetLength; j++) {
+						  currId = (currId << 8) | id.getPacketData(j);
+						}
+					}
+
+
+					// If this is a new id, let's start tracking it.
+					if (markers[currId] == null) {
+					
+						//create new object for the marker
+						markers[currId] = {};
+						
+						//create a new Three.js object as marker root
+						markerRoot = new THREE.Object3D();
+						markerRoot.matrixAutoUpdate = false; 
+						//markerRoot.eulerOrder = 'XYZ';
+						//markerRoot.matrixWorldNeedsUpdate = false;
+						//markerRoot.doubleSided = true;
+						//markerRoot.flipSided = false;
+						markerRoots[currId] = markerRoot;
+                                                           
+
+
+
+
+
+
+
+
+
+
+				        var max = 150;
+						var j = meshs.length;
+						
+						
+				        while (j--){
+				            scene.remove(meshs[ j ]);
+				        }
+				        world.clear();
+
+				        //add object
+				        var x, y, z, w, h, d;
+				        var i = max;
+
+				        while (i--){
+				            x = -100 + Math.random()*200;
+				            z = +1400 + Math.random()*200;
+				            y = -100 + Math.random()*1000;
+				            w = 10 + Math.random()*100;
+				            h = 10 + Math.random()*100;
+				            d = 10 + Math.random()*100;
+
+							b =  new OIMO.Body({type:'box', size:[w,h,d], pos:[x,y,z], move:true, world:world});
+			                bodys[i] = b.body;
+			                meshs[i] = new THREE.Mesh( geoBox, matBox );
+			                meshs[i].scale.set( w, h, d );
+				            scene.add( meshs[i] );
+				        } 
+				
+				        ground = new OIMO.Body({type:'box', size:[100, 40, 400], pos:[0,-20,0], rot:[60,60,40], move:true, world:world});
+				        ground2 = new OIMO.Body({type:'box', size:[400, 40, 400], pos:[0,-50,0], rot:[60,90,60], move:true, world:world});
+
+
+						                                
+						//add light
+						scene.add( new THREE.AmbientLight( 0x383838 ) );
+				        var light = new THREE.DirectionalLight( 0xffffff , 1.3);
+				        light.position.set( 0.3, 1, 0.5 ).normalize();
+				        markerRoot.add( light );						
+						
+						
+						
+						//add ground
+				        scene.add( mground0 );
+				        scene.add( mground1 );  
+				
+				
+				
+						var cube = new THREE.Mesh(
+						  new THREE.CubeGeometry(120,120,120),
+						  new THREE.MeshNormalMaterial({color: 0xff00ff, wireframe:true})
+						);
+						cube.position.z = -60;
+						//markerRoot.add(cube);    
+						
+						
+					   
+				
+				        // Add the marker root to your scene. 
+						scene.add(markerRoot);
+						
+						
+						
+					}
+					
+
+					detector.getTransformMatrix(iAR, resultMat);
+					copyMarkerMatrix4(resultMat, tmp);
+					markerRoots[currId].matrix.setFromArray(tmp);
+					rotMtx3 = new THREE.Matrix3().getInverse( markerRoots[currId].matrix);					
+					markerRoots[currId].matrixWorldNeedsUpdate = true; 
+					
+   	
+					
+				} 
+				
+   				loopOimo();		
+				
+
+				// Render the scene.
+				renderer.autoClear = false;
+				renderer.clear();
+				renderer.render(videoScene, videoCam);
+				renderer.render(scene, camera);
+			}
+		  
+		  requestAnimationFrame(loop);
+		}
+
+		
+	});
+	</script>
+</head>
+<body>
+	<div class="container invisible" id="video-container">
+		<div class="caption">&lt;video&gt;</div>
+		<video id="mainVideo" width="640" height="480" autoplay="autoplay" muted="true"></video>
+	</div>
+	<div class="container invisible" id="canvas-container">
+		<div class="caption">&lt;canvas&gt;</div>
+		<canvas id="mainCanvas" width="640" height="480"></canvas>
+	</div>
+	<div class="container invisible" id="debugCanvas-container">
+		<div class="caption">debug &lt;canvas&gt;</div>
+		<canvas id="debugCanvas" width="640" height="480"></canvas>
+	</div>      
+	<div class="container" id="threejs-container">
+		
+	</div>
+</body>
+</html>
